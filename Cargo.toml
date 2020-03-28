@@ -1,0 +1,26 @@
+[package]
+name = "minimal_quinn_network_repro"
+version = "0.1.0"
+authors = ["Sri Ramanujam"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+quinn = "0.6"
+tokio = { version = "0.2", features = ["full"] }
+rustls = { version = "0.17", features = ["dangerous_configuration"] }
+webpki = "0.21"
+anyhow = "1.0"
+futures = "0.3"
+bytes = "0.5"
+tracing-subscriber = "0.2"
+
+[[bin]]
+name = "server"
+path = "src/server/main.rs"
+
+
+[[bin]]
+name = "client"
+path = "src/client/main.rs"
