@@ -85,10 +85,13 @@ impl QuicClient {
         let (mut send, mut recv) = self.open_new_connection().await?;
 
         // send the request...
+        println!("sending request...");
         send.write_all(msg.as_bytes()).await?;
         send.finish().await?;
+        println!("request sent!");
 
         // ...and return the response.
+        println!("reading response...");
         let mut incoming = bytes::BytesMut::new();
         let mut recv_buffer = [0 as u8; 1024]; // 1 KiB socket recv buffer
         let mut msg_size = 0;

@@ -123,8 +123,12 @@ async fn handle_response(
     }
     println!("Received {} bytes from stream", msg_size);
 
+    println!("writing message to send stream...");
     send.write_all(incoming.freeze().slice(0..msg_size).as_ref())
         .await?;
+    println!("closing send stream...");
+    send.finish().await?;
 
+    println!("response handled!");
     Ok(())
 }
