@@ -1,6 +1,8 @@
 use anyhow::{anyhow, Result};
 use futures::{StreamExt, TryFutureExt};
 use std::sync::Arc;
+use quinn::ServerConfig;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 pub const CUSTOM_PROTO: &[&[u8]] = &[b"cstm-01"];
 
@@ -22,6 +24,7 @@ async fn run() -> Result<()> {
     let mut transport_config = quinn::TransportConfig::default();
     transport_config.stream_window_uni(0);
     transport_config.stream_window_bidi(10); // so it exhibits the problem quicker
+    transport_config.keep_alive_interval(Some(std::time::Duration::from_secs(1)));
     let mut quinn_config = quinn::ServerConfig::default();
     quinn_config.transport = Arc::new(transport_config);
 
@@ -47,26 +50,31 @@ async fn run() -> Result<()> {
 
     let server_config = server_config_builder.build();
 
-    // build the QUIC endpoint
+    tokio::try_join!(build_and_run_server(5000, server_config.clone()))?;
+
+    println!("shutting down...");
+
+    Ok(())
+}
+
+async fn build_and_run_server(port: u16, server_config: ServerConfig) -> Result<()> {
     let mut endpoint_builder = quinn::Endpoint::builder();
     endpoint_builder.listen(server_config.clone());
 
-    let socket_addr = "0.0.0.0:5000".parse()?;
+    let socket_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port);
 
-    let (_endpoint, mut incoming) = {
+    let mut incoming = {
         let (endpoint, incoming) = endpoint_builder.bind(&socket_addr)?;
         println!("Server listening on {}", endpoint.local_addr()?);
-        (endpoint, incoming)
+        incoming
     };
 
     while let Some(conn) = incoming.next().await {
-        println!("new connection!");
+        println!("{}: new connection!", socket_addr);
         tokio::spawn(handle_conn(conn).unwrap_or_else(move |e| {
-            eprintln!("Connection failed! {}", e);
+            println!("{}: connection failed: {}", socket_addr, e);
         }));
     }
-
-    println!("shutting down...");
 
     Ok(())
 }
@@ -123,9 +131,27 @@ async fn handle_response(
     }
     println!("Received {} bytes from stream", msg_size);
 
+    // I've seen all three of the below snippets exhibit the error, although it doesn't happen every time.
+
+    /*
+    let body = tokio::task::block_in_place(|| -> Result<Vec<u8>> {
+        let data = std::fs::read("./random_data.bin")?;
+
+        Ok(data)
+    })?;
+    */
+
+    let body = tokio::task::spawn_blocking(|| -> Result<Vec<u8>> {
+        Ok(std::fs::read("./random_data.bin")?)
+    }).await??;
+
+    /*
+    let body = std::fs::read("./random_data.bin")?;
+    */
+
     println!("writing message to send stream...");
-    send.write_all(incoming.freeze().slice(0..msg_size).as_ref())
-        .await?;
+    send.write_all(&body).await?;
+
     println!("closing send stream...");
     send.finish().await?;
 

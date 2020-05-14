@@ -1,6 +1,9 @@
 use anyhow::{anyhow, Context, Result};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::future::Future;
+use futures::stream::FuturesUnordered;
+use futures::StreamExt;
 
 mod insecure {
     use rustls;
@@ -21,6 +24,7 @@ mod insecure {
     }
 }
 
+#[derive(Clone)]
 pub struct QuicClient {
     endpoint: quinn::Endpoint,
     conn: quinn::Connection,
@@ -80,37 +84,42 @@ impl QuicClient {
     }
 
     /// Make the request to the remote peer and receive a response.
-    /// TODO: timeouts
     pub async fn make_request(&mut self, msg: &str) -> anyhow::Result<()> {
         let (mut send, mut recv) = self.open_new_connection().await?;
 
-        // send the request...
-        println!("sending request...");
-        send.write_all(msg.as_bytes()).await?;
-        send.finish().await?;
-        println!("request sent!");
+        async fn do_request(msg: &str, send: &mut quinn::SendStream, recv: &mut quinn::RecvStream) -> Result<()> {
+            // send the request...
+            println!("sending request...");
+            send.write_all(msg.as_bytes()).await?;
+            send.finish().await?;
+            println!("request sent!");
 
-        // ...and return the response.
-        println!("reading response...");
-        let mut incoming = bytes::BytesMut::new();
-        let mut recv_buffer = [0 as u8; 1024]; // 1 KiB socket recv buffer
-        let mut msg_size = 0;
+            // ...and return the response.
+            println!("reading response...");
+            let mut incoming = bytes::BytesMut::new();
+            let mut recv_buffer = [0 as u8; 1024]; // 1 KiB socket recv buffer
+            let mut msg_size = 0;
 
-        while let Some(s) = recv
-            .read(&mut recv_buffer)
-            .await
-            .map_err(|e| anyhow!("Could not read message from recv stream: {}", e))?
-        {
-            msg_size += s;
-            incoming.extend_from_slice(&recv_buffer[0..s]);
+            while let Some(s) = recv
+                .read(&mut recv_buffer)
+                .await
+                .map_err(|e| anyhow!("Could not read message from recv stream: {}", e))?
+            {
+                msg_size += s;
+                incoming.extend_from_slice(&recv_buffer[0..s]);
+            }
+
+            let frozen = incoming.freeze();
+            let ret = std::str::from_utf8(frozen.as_ref())?;
+            println!(
+                "Received response {} bytes long from server: {}",
+                msg_size, ret
+            );
+
+            Ok(())
         }
 
-        let frozen = incoming.freeze();
-        let ret = std::str::from_utf8(frozen.as_ref())?;
-        println!(
-            "Received response {} bytes long from server: {}",
-            msg_size, ret
-        );
+        do_request(msg, &mut send, &mut recv).await.map_err(|e| anyhow!("making request failed: {}", e))?;
 
         Ok(())
     }
@@ -120,19 +129,38 @@ impl QuicClient {
     }
 }
 
+/// generates three futures that make the same request for each client passed in.
+fn generate_futures(client: &QuicClient) -> FuturesUnordered<impl Future<Output = anyhow::Result<()>>> {
+    let requests = FuturesUnordered::new();
+
+        for _ in 0..3 {
+            let mut cloned = client.clone();
+            requests.push(async move {
+                cloned.make_request("Hello, world!").await
+            })
+        }
+
+    requests
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
-    let mut client = QuicClient::new_insecure("127.0.0.1:5000").await?;
+    let client = QuicClient::new_insecure("127.0.0.1:5000").await?;
 
-    for i in 1..1000000000 {
-        client
-            .make_request("Hello, world!")
-            .await
-            .context(format!("Could not make request number {}", i))?;
+    for _ in 1..1000000000 {
+        let mut requests = generate_futures(&client);
 
-        std::thread::sleep(std::time::Duration::new(1, 0)); // sleep for 1 second between requests
+        let mut finished_ops = 0;
+        let max_finished_ops = 1;
+
+        while finished_ops < max_finished_ops {
+            match requests.next().await {
+                Some(_) => finished_ops += 1,
+                None => println!("Finished the stream before getting enough ops: {} vs {}", finished_ops, max_finished_ops)
+            }
+        }
     }
 
     client.close();
