@@ -7,15 +7,17 @@ edition = "2018"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-# quinn = { version = "0.6", path = "../quinn/quinn" }
 quinn = "0.6.1"
 tokio = { version = "^0.2.20", features = ["full"] }
-rustls = { version = "0.17", features = ["dangerous_configuration"] }
+rustls = { version = "0.18", features = ["dangerous_configuration"] }
 webpki = "0.21"
 anyhow = "1.0"
 futures = "0.3"
 bytes = "0.5"
 tracing-subscriber = "0.2"
+log = "0.4"
+tracing = "0.1.21"
+tracing-futures = "0.2.4"
 
 [[bin]]
 name = "server"
@@ -25,3 +27,8 @@ path = "src/server/main.rs"
 [[bin]]
 name = "client"
 path = "src/client/main.rs"
+
+# Temporary git rev pin to fix flow control issue until quinn puts out a new version.
+[patch.crates-io]
+rustls = { git = "https://github.com/ctz/rustls", rev = "fee894f7e030" }
+quinn = { git = "https://github.com/djc/quinn", rev = "a68e18c6e60d7eac4046b3831a2075f28878e95c" }

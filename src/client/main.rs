@@ -1,9 +1,9 @@
 use anyhow::{anyhow, Context, Result};
-use std::net::SocketAddr;
+use log::{debug, error, info, warn};
+use tokio::time::timeout;
+use std::{net::SocketAddr, time::Duration};
 use std::sync::Arc;
-use std::future::Future;
-use futures::stream::FuturesUnordered;
-use futures::StreamExt;
+use tracing_futures::Instrument;
 
 mod insecure {
     use rustls;
@@ -53,8 +53,13 @@ impl QuicClient {
                 .set_certificate_verifier(Arc::new(insecure::NoCertificateVerification {}));
         }
 
+        let mut transport_config = quinn::TransportConfig::default();
+        transport_config.receive_window(u32::MAX.into());
+        transport_config.send_window(u32::MAX.into());
+        transport_config.stream_receive_window(1153433); // 110% of 1MiB.
+
         let config = quinn::ClientConfig {
-            transport: Arc::new(quinn::TransportConfig::default()),
+            transport: Arc::new(transport_config),
             crypto: Arc::new(crypto),
         };
 
@@ -79,25 +84,26 @@ impl QuicClient {
     }
 
     #[doc(hidden)]
-    async fn open_new_connection(&mut self) -> Result<(quinn::SendStream, quinn::RecvStream)> {
+    async fn open_new_connection(&self) -> Result<(quinn::SendStream, quinn::RecvStream)> {
         Ok(self.conn.open_bi().await?)
     }
 
     /// Make the request to the remote peer and receive a response.
-    pub async fn make_request(&mut self, msg: &str) -> anyhow::Result<()> {
+    pub async fn make_request(&self, msg: usize) -> anyhow::Result<()> {
         let (mut send, mut recv) = self.open_new_connection().await?;
 
-        async fn do_request(msg: &str, send: &mut quinn::SendStream, recv: &mut quinn::RecvStream) -> Result<()> {
+        async fn do_request(msg: usize, send: &mut quinn::SendStream, recv: &mut quinn::RecvStream) -> Result<()> {
             // send the request...
-            println!("sending request...");
-            send.write_all(msg.as_bytes()).await?;
+            debug!("sending request...");
+            send.write_all(&msg.to_string().into_bytes()).await?;
             send.finish().await?;
-            println!("request sent!");
+            debug!("request sent!");
 
             // ...and return the response.
-            println!("reading response...");
+            debug!("reading response...");
             let mut incoming = bytes::BytesMut::new();
-            let mut recv_buffer = [0 as u8; 1024]; // 1 KiB socket recv buffer
+            let mut recv_buffer = Vec::<u8>::with_capacity(1048576); // 1 MiB receive buffer
+            recv_buffer.resize_with(1048576, || 0x0);
             let mut msg_size = 0;
 
             while let Some(s) = recv
@@ -106,12 +112,13 @@ impl QuicClient {
                 .map_err(|e| anyhow!("Could not read message from recv stream: {}", e))?
             {
                 msg_size += s;
+                debug!("Read {} from stream this iter!", s);
                 incoming.extend_from_slice(&recv_buffer[0..s]);
             }
 
             let frozen = incoming.freeze();
             let ret = std::str::from_utf8(frozen.as_ref())?;
-            println!(
+            info!(
                 "Received response {} bytes long from server: {}",
                 msg_size, ret
             );
@@ -119,7 +126,14 @@ impl QuicClient {
             Ok(())
         }
 
-        do_request(msg, &mut send, &mut recv).await.map_err(|e| anyhow!("making request failed: {}", e))?;
+        let x = do_request(msg, &mut send, &mut recv).instrument(tracing::info_span!("Making request and waiting for response"));
+
+        let x = timeout(Duration::from_millis(2000), x);
+        
+        x.await.map_err(|e| {
+            error!("Request timed out: {}", e);
+            anyhow!("Request timed out: {}", e)
+        })??;
 
         Ok(())
     }
@@ -129,41 +143,53 @@ impl QuicClient {
     }
 }
 
-/// generates three futures that make the same request for each client passed in.
-fn generate_futures(client: &QuicClient) -> FuturesUnordered<impl Future<Output = anyhow::Result<()>>> {
-    let requests = FuturesUnordered::new();
-
-        for _ in 0..3 {
-            let mut cloned = client.clone();
-            requests.push(async move {
-                cloned.make_request("Hello, world!").await
-            })
-        }
-
-    requests
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
+    let num_reqs = 512;
+
     let client = QuicClient::new_insecure("127.0.0.1:5000").await?;
 
-    for _ in 1..1000000000 {
-        let mut requests = generate_futures(&client);
+    let (sender, mut receiver) = tokio::sync::mpsc::channel::<Result<()>>(num_reqs);
 
-        let mut finished_ops = 0;
-        let max_finished_ops = 1;
+    info!("Starting {} spawned requests", num_reqs);
 
-        while finished_ops < max_finished_ops {
-            match requests.next().await {
-                Some(_) => finished_ops += 1,
-                None => println!("Finished the stream before getting enough ops: {} vs {}", finished_ops, max_finished_ops)
+    for i in 0..num_reqs {
+        let c = client.clone();
+        let mut s = sender.clone();
+
+        let f = async move {
+            let x = c.make_request(i).await;
+
+            if let Err(e) = s.send(x).await {
+                error!("Could not send message to receiver! {}", e);
             }
+        }.instrument(tracing::info_span!("Request", num = i));
+
+        // spawn it off
+        tokio::spawn(f);
+    }
+
+    info!("Started {} spawned requests, collecting responses", num_reqs);
+
+    let mut completed_tasks = 0;
+    let mut num_trials = num_reqs;
+
+    while let Some(s) = receiver.recv().await {
+        match s {
+            Ok(_) => completed_tasks += 1,
+            Err(e) => debug!("Task returned error: {}", e)
+        }
+
+        num_trials += 1;
+
+        if completed_tasks > num_reqs {
+            warn!("completed_tasks > num_reqs: {} > {}", completed_tasks, num_reqs);
         }
     }
 
-    client.close();
+    info!("Got successful results from {} spawned tasks with {} trials", num_reqs, num_trials);
 
     Ok(())
 }
