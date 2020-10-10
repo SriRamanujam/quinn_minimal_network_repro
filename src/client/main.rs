@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use log::{debug, error, info, warn};
 use tokio::time::timeout;
-use std::{net::SocketAddr, time::Duration};
+use std::{convert::TryFrom, net::SocketAddr, time::Duration};
 use std::sync::Arc;
 use tracing_futures::Instrument;
 
@@ -94,41 +94,40 @@ impl QuicClient {
 
         async fn do_request(msg: usize, send: &mut quinn::SendStream, recv: &mut quinn::RecvStream) -> Result<()> {
             // send the request...
-            debug!("sending request...");
+            info!("Sending request...");
             send.write_all(&msg.to_string().into_bytes()).await?;
             send.finish().await?;
             debug!("request sent!");
 
             // ...and return the response.
-            debug!("reading response...");
+            info!("Reading response...");
             let mut incoming = bytes::BytesMut::new();
             let mut recv_buffer = Vec::<u8>::with_capacity(1048576); // 1 MiB receive buffer
             recv_buffer.resize_with(1048576, || 0x0);
-            let mut msg_size = 0;
 
-            while let Some(s) = recv
-                .read(&mut recv_buffer)
+            while let Some((data, offset)) = recv
+                .read_unordered()
                 .await
-                .map_err(|e| anyhow!("Could not read message from recv stream: {}", e))?
+                .map_err(|e| anyhow!("could not read message from recv stream: {}", e))? 
             {
-                msg_size += s;
-                debug!("Read {} from stream this iter!", s);
-                incoming.extend_from_slice(&recv_buffer[0..s]);
-            }
+                debug!("Read {} bytes from stream at offset {}", data.len(), offset);
+                let offset_as_usize = usize::try_from(offset)?;
+                let max_extent = offset_as_usize + data.len();
 
-            let frozen = incoming.freeze();
-            let ret = std::str::from_utf8(frozen.as_ref())?;
-            info!(
-                "Received response {} bytes long from server: {}",
-                msg_size, ret
-            );
+                if max_extent > incoming.len() {
+                    incoming.resize(max_extent, 0x0);
+                }
+
+                incoming[offset_as_usize..max_extent].copy_from_slice(&data[..]);
+            }
+            info!("Response fully read!");
 
             Ok(())
         }
 
         let x = do_request(msg, &mut send, &mut recv).instrument(tracing::info_span!("Making request and waiting for response"));
 
-        let x = timeout(Duration::from_millis(2000), x);
+        let x = timeout(Duration::from_millis(10000), x);
         
         x.await.map_err(|e| {
             error!("Request timed out: {}", e);
@@ -145,13 +144,13 @@ impl QuicClient {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt::init();
+    tracing_subscriber::fmt::SubscriberBuilder::default().with_ansi(false).init();
 
     let num_reqs = 512;
 
     let client = QuicClient::new_insecure("127.0.0.1:5000").await?;
 
-    let (sender, mut receiver) = tokio::sync::mpsc::channel::<Result<()>>(num_reqs);
+    let (sender, mut receiver) = tokio::sync::mpsc::channel::<Result<usize>>(num_reqs);
 
     info!("Starting {} spawned requests", num_reqs);
 
@@ -160,7 +159,7 @@ async fn main() -> Result<()> {
         let mut s = sender.clone();
 
         let f = async move {
-            let x = c.make_request(i).await;
+            let x = c.make_request(i).await.map(|_| i);
 
             if let Err(e) = s.send(x).await {
                 error!("Could not send message to receiver! {}", e);
@@ -174,11 +173,14 @@ async fn main() -> Result<()> {
     info!("Started {} spawned requests, collecting responses", num_reqs);
 
     let mut completed_tasks = 0;
-    let mut num_trials = num_reqs;
+    let mut num_trials = 0;
 
     while let Some(s) = receiver.recv().await {
         match s {
-            Ok(_) => completed_tasks += 1,
+            Ok(req) => { 
+                info!("Completed task {}!", req);
+                completed_tasks += 1;
+            },
             Err(e) => debug!("Task returned error: {}", e)
         }
 
@@ -187,7 +189,13 @@ async fn main() -> Result<()> {
         if completed_tasks > num_reqs {
             warn!("completed_tasks > num_reqs: {} > {}", completed_tasks, num_reqs);
         }
+
+        if completed_tasks == num_reqs {
+            break;
+        }
     }
+
+    client.close();
 
     info!("Got successful results from {} spawned tasks with {} trials", num_reqs, num_trials);
 

@@ -23,7 +23,7 @@ fn main() {
 
 #[tokio::main]
 async fn run() -> Result<()> {
-    tracing_subscriber::fmt::init();
+    tracing_subscriber::fmt::SubscriberBuilder::default().with_ansi(false).init();
 
     let mut transport_config = quinn::TransportConfig::default();
     transport_config.stream_window_uni(0);
@@ -150,13 +150,13 @@ async fn handle_response(
             Ok(std::fs::read("./random_data.bin")?)
         }).await??;
 
-        debug!("Read complete! Writing message to send stream...");
+        info!("Read complete! Writing message to send stream...");
         send.write_all(&body).await?;
 
         debug!("closing send stream...");
         send.finish().await?;
 
-        debug!("response handled!");
+        info!("response handled!");
 
         Ok(())
     }.instrument(tracing::info_span!("Response", num = msg)).await;
