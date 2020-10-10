@@ -146,7 +146,10 @@ impl QuicClient {
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::SubscriberBuilder::default().with_ansi(false).init();
 
+    // TUNABLES //
     let num_reqs = 512;
+    let use_spawn = false;
+    // END TUNABLES //
 
     let client = QuicClient::new_insecure("127.0.0.1:5000").await?;
 
@@ -166,8 +169,12 @@ async fn main() -> Result<()> {
             }
         }.instrument(tracing::info_span!("Request", num = i));
 
-        // spawn it off
-        tokio::spawn(f);
+        if use_spawn {
+            // spawn it off
+            tokio::spawn(f);
+        } else {
+            f.await;
+        }
     }
 
     info!("Started {} spawned requests, collecting responses", num_reqs);
